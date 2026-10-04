@@ -1,0 +1,6 @@
+# compiled binary
+ghostlink
+
+# IDE
+.idea/
+*.iml
