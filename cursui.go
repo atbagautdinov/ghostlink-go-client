@@ -12,19 +12,21 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 	"unsafe"
-
-	"github.com/godbus/dbus/v5"
 )
 
-// tui is the ncurses front-end: a scrollable chat window plus a single-line
-// input at the bottom.
-//
-// The TUI starts first (before the connection), so connection progress and
-// failures render inside ncurses instead of aborting to a raw terminal.
+// Color pair ids used by cursesPrint.
+const (
+	colMe     = 1 // green
+	colPhone  = 2 // cyan
+	colSystem = 3 // yellow
+	colHeader = 4 // not used directly here
+)
+
+// tui is the ncurses front-end. It is created before anything else, so the
+// UI is visible from the very first moment - including while scanning.
 type tui struct{}
 
 func newTUI() (*tui, error) {
@@ -34,11 +36,10 @@ func newTUI() (*tui, error) {
 	return &tui{}, nil
 }
 
-func (t *tui) close()      { C.cursesShutdown() }
-func (t *tui) resize()     { C.cursesResize() }
-func (t *tui) clear()      { C.cursesClear() }
+func (t *tui) close()        { C.cursesShutdown() }
+func (t *tui) resize()       { C.cursesResize() }
+func (t *tui) clear()        { C.cursesClear() }
 func (t *tui) termCols() int { return int(C.cursesCols()) }
-func (t *tui) chatRows() int { return int(C.cursesChatRows()) }
 
 func (t *tui) printLine(s string, color int) {
 	cs := C.CString(s)
@@ -52,14 +53,29 @@ func (t *tui) header(s string) {
 	C.cursesHeader(cs)
 }
 
-// status renders a one-line system message in yellow at the bottom of the
-// chat window, so connection events are always visible.
-func (t *tui) status(s string) {
-	t.printLine("> "+s, 3)
+// status renders a one-line system message in yellow, so connection events
+// are always visible.
+func (t *tui) status(s string) { t.printLine("> "+s, colSystem) }
+
+// drawInput shows prompt+text on the input line.
+func (t *tui) drawInput(prompt, text string) {
+	cp := C.CString(prompt)
+	defer C.free(unsafe.Pointer(cp))
+	ct := C.CString(text)
+	defer C.free(unsafe.Pointer(ct))
+	C.cursesDrawInput(cp, ct)
 }
 
-// prompt shows the prompt and reads one line; returns ("", false) on cancel
-// (ESC / Ctrl-C / empty). Polls keystrokes so callers can stay responsive.
+// key waits up to ms for a keypress; returns rune or -1 (and ok=false) on
+// timeout. Ctrl-C is 3, ESC is 27, Enter is 10/13.
+func (t *tui) key(ms int) (int, bool) {
+	c := int(C.cursesKey(C.int(ms)))
+	if c < 0 {
+		return 0, false
+	}
+	return c, true
+}
+
 func (t *tui) prompt(p string) (string, bool) {
 	buf := make([]byte, 256)
 	cp := C.CString(p)
@@ -68,13 +84,16 @@ func (t *tui) prompt(p string) (string, bool) {
 	if rc < 0 {
 		return "", false
 	}
-	s := C.GoString((*C.char)(unsafe.Pointer(&buf[0])))
-	s = strings.TrimSpace(s)
+	s := strings.TrimSpace(C.GoString((*C.char)(unsafe.Pointer(&buf[0]))))
 	if s == "" {
 		return "", false
 	}
 	return s, true
 }
+
+// ---------------------------------------------------------------------------
+// Text helpers
+// ---------------------------------------------------------------------------
 
 // wrap splits s into lines of width cols using simple word wrapping.
 func wrap(s string, cols int) []string {
@@ -91,12 +110,10 @@ func wrap(s string, cols int) []string {
 		if i := lastSpace(runes[:cols]); i > 0 {
 			cut = i
 		}
-		line := trim(string(runes[:cut]))
-		out = append(out, line)
+		out = append(out, trim(string(runes[:cut])))
 		runes = runes[cut:]
 	}
-	line := trim(string(runes))
-	out = append(out, line)
+	out = append(out, trim(string(runes)))
 	return out
 }
 
@@ -110,65 +127,177 @@ func lastSpace(r []rune) int {
 }
 
 func trim(s string) string {
-	i, j := 0, len(s)
-	for i < j && (s[i] == ' ' || s[i] == '\t' || s[i] == '\r' || s[i] == '\n') {
-		i++
-	}
-	for j > i && (s[j-1] == ' ' || s[j-1] == '\t' || s[j-1] == '\r' || s[j-1] == '\n') {
-		j--
-	}
-	return s[i:j]
+	return strings.TrimSpace(s)
 }
 
-// chatTUI drives the whole ncurses session: connect (if f == nil), then run
-// the read/write chat loop. Every error surfaces inside ncurses so the UI
-// stays up even when things fail.
-func chatTUI(ctx context.Context, bz *bluez, target *device, f *os.File) error {
+// ---------------------------------------------------------------------------
+// Device menu
+// ---------------------------------------------------------------------------
+
+// pickDevice shows a numbered list of devices and lets the user choose one
+// with arrow keys / digits / Enter. Returns the chosen device, or false when
+// the user quits (q / ESC / Ctrl-C).
+func (t *tui) pickDevice(devs []device) (*device, bool) {
+	if len(devs) == 0 {
+		return nil, false
+	}
+	sel := 0
+	draw := func() {
+		t.header("ghostlink - select a device   [UP/DOWN move, Enter connect, q quit]")
+		t.clear()
+		for i := range devs {
+			d := devs[i]
+			line := fmt.Sprintf("  %d) %-20s %s", i+1, d.name, d.addr)
+			if !hasUUID(d.uuids, sppUUID) {
+				line += "  (no GhostLink service)"
+			}
+			if i == sel {
+				t.printLine("> "+line, colMe)
+			} else {
+				t.printLine("  "+line, colSystem)
+			}
+		}
+		t.drawInput("choose> ", "")
+	}
+	draw()
+
+	for {
+		c, ok := t.key(250)
+		if !ok {
+			continue
+		}
+		switch c {
+		case 27, 'q', 'Q', 3:
+			return nil, false
+		case 10, 13:
+			d := devs[sel]
+			return &d, true
+		case 65, 107: // up arrow / k
+			if sel > 0 {
+				sel--
+			}
+			draw()
+		case 66, 106: // down arrow / j
+			if sel < len(devs)-1 {
+				sel++
+			}
+			draw()
+		default:
+			if c >= '1' && c <= '9' {
+				idx := int(c - '1')
+				if idx < len(devs) {
+					sel = idx
+					draw()
+				}
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Connection
+// ---------------------------------------------------------------------------
+
+// connectDevice opens the RFCOMM channel to d. Progress is printed into the
+// TUI so failures never leave a blank terminal.
+func (t *tui) connectDevice(ctx context.Context, bz *bluez, d *device) (*os.File, error) {
+	t.status(fmt.Sprintf("connecting to %s (%s) ...", d.name, d.addr))
+
+	if err := bz.call(d.path, "org.bluez.Device1.Connect"); err != nil {
+		t.status("Device1.Connect: " + err.Error())
+		t.status("(on the phone: Bluetooth on, GhostLink in 'Host' mode)")
+	}
+
+	// Fast path: older BlueZ publishes SerialPort1 immediately.
+	if ch, ok := bz.serialPortChannel(d.path); ok {
+		if f, err := os.OpenFile(rfcommDir()+fmt.Sprintf("/rfcomm%d", ch), os.O_RDWR, 0); err == nil {
+			t.status(fmt.Sprintf("connected! RFCOMM channel %d", ch))
+			return f, nil
+		}
+	}
+
+	// BlueZ 5.85+: read the channel from SDP, then open a raw socket.
+	t.status("looking up GhostLink RFCOMM channel ...")
+	channel := getChannelFromSDP(d.addr)
+	if channel <= 0 {
+		channel = 28
+		t.status("SDP lookup failed, trying channel 28")
+	} else {
+		t.status(fmt.Sprintf("SDP says GhostLink is on RFCOMM channel %d", channel))
+	}
+
+	f, err := connectRFCOMMSocket(d.addr, channel)
+	if err != nil {
+		return nil, err
+	}
+	t.status("connected!")
+	return f, nil
+}
+
+// ---------------------------------------------------------------------------
+// Chat
+// ---------------------------------------------------------------------------
+
+// chatTUI is the main entry: it starts the UI, asks the user to pick a device
+// from a scan, connects, and then runs the chat. Nothing is printed to the
+// raw terminal - every state is rendered inside ncurses.
+func chatTUI(ctx context.Context, bz *bluez, preset *device, scanDur time.Duration) error {
 	t, err := newTUI()
 	if err != nil {
 		return err
 	}
 	defer t.close()
-
-	t.header("ghostlink TUI — Ctrl-C/ESC or empty line to quit")
 	t.resize()
 
-	// --- connection phase (inside the UI) ---
-	if f == nil {
-		t.status("connecting to " + target.addr + " ...")
-		if err := bz.conn.Object(bzSvc, target.path).Call("org.bluez.Device1.Connect", dbus.Flags(0)).Store(); err != nil {
-			t.status("Device1.Connect failed: " + err.Error())
-			t.status("waiting for rfcomm channel ...")
-			if err := waitSerialPort(ctx, bz, target, t); err != nil {
-				t.status("connect failed: " + err.Error())
-				t.printLine("press any key to return", 3)
-				_, _ = t.prompt("")
-				return err
-			}
+	target, ok := preset, preset != nil
+	if !ok {
+		// ---- scanning phase (UI is already up) ----
+		t.header("ghostlink - scanning   [q to quit]")
+		t.clear()
+		t.status("scanning for nearby devices ...")
+		t.status("on the phone: Bluetooth on, GhostLink app in 'Host' mode")
+
+		devs, err := t.scanDevices(ctx, bz, scanDur)
+		if err != nil {
+			t.status("scan failed: " + err.Error())
+			t.printLine("press any key to return", colSystem)
+			_, _ = t.key(-1)
+			return err
 		}
-		channel, chErr := ghostLinkChannel(ctx, bz, target, t)
-		if chErr != nil {
-			t.status("rfcomm channel not found: " + chErr.Error())
-			t.printLine("press any key to return", 3)
-			_, _ = t.prompt("")
-			return chErr
+		if len(devs) == 0 {
+			t.status("no devices found")
+			t.printLine("press any key to return", colSystem)
+			_, _ = t.key(-1)
+			return errors.New("no devices found")
 		}
-		t.status("rfcomm channel " + channel + " — connecting ...")
-		ch, _ := strconv.Atoi(channel)
-		var ferr error
-		f, ferr = connectRFCOMMSocket(target.addr, ch)
-		if ferr != nil {
-			t.status("rfcomm open failed: " + ferr.Error())
-			t.printLine("press any key to return", 3)
-			_, _ = t.prompt("")
-			return ferr
+
+		// ---- picker phase ----
+		picked, ok := t.pickDevice(devs)
+		if !ok {
+			return nil
 		}
-		t.status("connected!")
+		target = picked
 	}
 
+	// ---- connect phase ----
+	f, err := t.connectDevice(ctx, bz, target)
+	if err != nil {
+		t.status("connection failed: " + err.Error())
+		t.printLine("press any key to return", colSystem)
+		_, _ = t.key(-1)
+		return err
+	}
 	defer f.Close()
 
-	// --- chat phase ---
+	// ---- chat phase ----
+	t.clear()
+	t.header(fmt.Sprintf("ghostlink - chatting with %s   [Ctrl-C/ESC quit]", target.name))
+	return t.runChat(ctx, target, f)
+}
+
+// runChat is the actual conversation loop: incoming bytes from the phone are
+// printed in cyan; the user types lines that are sent raw (no newline).
+func (t *tui) runChat(ctx context.Context, target *device, f *os.File) error {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -177,8 +306,8 @@ func chatTUI(ctx context.Context, bz *bluez, target *device, f *os.File) error {
 			n, err := f.Read(buf)
 			if n > 0 {
 				msg := string(buf[:n])
-				for _, ln := range wrap(msg, t.termCols()) {
-					t.printLine("phone: "+ln, 2) // 2 = cyan
+				for _, ln := range wrap(msg, t.termCols()-8) {
+					t.printLine("phone: "+ln, colPhone)
 				}
 			}
 			if err != nil {
@@ -187,87 +316,105 @@ func chatTUI(ctx context.Context, bz *bluez, target *device, f *os.File) error {
 		}
 	}()
 
+	// Poll-and-draw input loop so incoming messages appear immediately while
+	// the user is typing.
+	var input []rune
+	t.drawInput("> ", "")
 	for {
-		s, ok := t.prompt("> ")
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-done:
+			t.status("connection closed by peer")
+			return nil
+		default:
+		}
+
+		c, ok := t.key(100)
 		if !ok {
-			break
+			continue
 		}
-		if _, err := f.Write([]byte(s)); err != nil {
-			t.printLine("send failed: "+err.Error(), 3) // 3 = yellow
-			return err
+		switch {
+		case c == 3 || c == 27: // Ctrl-C / ESC
+			return nil
+		case c == 10 || c == 13: // Enter: send
+			msg := strings.TrimSpace(string(input))
+			input = input[:0]
+			t.drawInput("> ", "")
+			if msg == "" {
+				continue
+			}
+			if _, err := f.Write([]byte(msg)); err != nil {
+				t.printLine("send failed: "+err.Error(), colSystem)
+				return err
+			}
+			t.printLine("me: "+msg, colMe)
+		case c == 127 || c == 8 || c == 263: // Backspace
+			if len(input) > 0 {
+				input = input[:len(input)-1]
+				t.drawInput("> ", string(input))
+			}
+		case c >= 32 && c < 127:
+			input = append(input, rune(c))
+			t.drawInput("> ", string(input))
 		}
-		f.Sync()
-		t.printLine("me: "+s, 1) // 1 = green
 	}
-
-	select {
-	case <-done:
-	case <-time.After(500 * time.Millisecond):
-	}
-	return nil
 }
 
-// ghostLinkChannel waits for org.bluez.SerialPort1 (older BlueZ) under the
-// device path and returns its RFCOMM channel as a string.
-func ghostLinkChannel(ctx context.Context, bz *bluez, target *device, t *tui) (string, error) {
-	deadline := time.Now().Add(8 * time.Second)
-	for {
-		objs, err := bz.managed()
-		if err == nil {
-			for path, ifaces := range objs {
-				sp, ok := ifaces["org.bluez.SerialPort1"]
-				if !ok || !strings.HasPrefix(string(path), string(target.path)) {
-					continue
-				}
-				if ch, ok := sp["Path"].Value().(uint16); ok {
-					return fmt.Sprintf("%d", ch), nil
-				}
-			}
-		}
-		if time.Now().After(deadline) {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			return "", ctx.Err()
-		default:
-		}
-		time.Sleep(300 * time.Millisecond)
+// scanDevices runs Bluetooth discovery for scanDur and returns everything
+// found, refreshing the list in the UI as results arrive.
+func (t *tui) scanDevices(ctx context.Context, bz *bluez, scanDur time.Duration) ([]device, error) {
+	adapter := bz.adapterPath()
+	if adapter == "" {
+		return nil, errors.New("no Bluetooth adapter (is BlueZ running? rfkill list bluetooth)")
 	}
-	return "", errors.New("SerialPort1 never appeared")
-}
+	// Make sure the adapter is powered.
+	if v, err := bz.getProperty(adapter, "org.bluez.Adapter1", "Powered"); err == nil {
+		var powered bool
+		if v.Store(&powered) == nil && !powered {
+			t.status("adapter off - powering on ...")
+			_ = bz.setProperty(adapter, "org.bluez.Adapter1", "Powered", true)
+		}
+	}
 
-// waitSerialPort waits for SerialPort1 (older BlueZ path) and opens the rfcomm
-// tty node.
-func waitSerialPort(ctx context.Context, bz *bluez, target *device, t *tui) error {
-	deadline := time.Now().Add(8 * time.Second)
-	for {
-		objs, err := bz.managed()
-		if err == nil {
-			for path, ifaces := range objs {
-				sp, ok := ifaces["org.bluez.SerialPort1"]
-				if !ok || !strings.HasPrefix(string(path), string(target.path)) {
-					continue
-				}
-				if ch, ok := sp["Path"].Value().(uint16); ok {
-					f, err := os.OpenFile(rfcommDir()+fmt.Sprintf("/rfcomm%d", ch), os.O_RDWR, 0)
-					if err != nil {
-						return err
-					}
-					f.Close()
-					return nil
-				}
-			}
-		}
-		if time.Now().After(deadline) {
-			break
-		}
+	if err := bz.call(adapter, "org.bluez.Adapter1.StartDiscovery"); err != nil {
+		return nil, fmt.Errorf("StartDiscovery: %w", err)
+	}
+	defer bz.call(adapter, "org.bluez.Adapter1.StopDiscovery")
+
+	deadline := time.Now().Add(scanDur)
+	seen := map[string]bool{}
+	var devs []device
+
+	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return devs, nil
 		default:
 		}
-		time.Sleep(300 * time.Millisecond)
+		changed := false
+		for _, d := range bz.findDevices(false) {
+			if seen[d.addr] {
+				continue
+			}
+			seen[d.addr] = true
+			devs = append(devs, d)
+			changed = true
+		}
+		if changed {
+			t.header(fmt.Sprintf("ghostlink - scanning %ds   [q to quit]", int(time.Until(deadline).Seconds())+1))
+			t.clear()
+			for _, d := range devs {
+				tag := ""
+				if hasUUID(d.uuids, sppUUID) {
+					tag = "  <- GhostLink"
+				}
+				t.printLine(fmt.Sprintf("  %-20s %s%s", d.name, d.addr, tag), colSystem)
+			}
+		}
+		if c, ok := t.key(300); ok && (c == 'q' || c == 3 || c == 27) {
+			return devs, nil
+		}
 	}
-	return errors.New("SerialPort1 never appeared")
+	return devs, nil
 }

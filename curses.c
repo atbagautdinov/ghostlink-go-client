@@ -6,14 +6,14 @@
 static WINDOW *chatwin = NULL;
 static WINDOW *inwin   = NULL;
 static int rows = 24, cols = 80;
-static char inputbuf[512];
 
-static void redrawInput(const char *prompt) {
+/* Redraw the input line (prompt + typed text). */
+static void redrawInput(const char *prompt, const char *input) {
     werase(inwin);
     wattron(inwin, COLOR_PAIR(3) | A_BOLD);
     waddstr(inwin, prompt);
     wattroff(inwin, COLOR_PAIR(3) | A_BOLD);
-    waddstr(inwin, inputbuf);
+    waddstr(inwin, input);
     wrefresh(inwin);
 }
 
@@ -80,32 +80,37 @@ void cursesHeader(const char *text) {
 int cursesCols(void) { return cols; }
 int cursesChatRows(void) { return rows - 3; }
 
+/* Non-blocking key poll: waits up to ms for a key, returns -1 if none. */
+int cursesKey(int ms) {
+    if (!inwin) return -1;
+    wtimeout(inwin, ms);
+    return wgetch(inwin);
+}
+
+/* Draw a custom input line (prompt + text). Used by the chat state. */
+void cursesDrawInput(const char *prompt, const char *input) {
+    redrawInput(prompt, input);
+}
+
+/* Blocking line input (legacy, kept for simple prompts). */
 int cursesPrompt(const char *prompt, char *buf, int len) {
     if (!inwin) return -1;
-    werase(inwin);
-    wattron(inwin, COLOR_PAIR(3) | A_BOLD);
-    waddstr(inwin, prompt);
-    wattroff(inwin, COLOR_PAIR(3) | A_BOLD);
-    wrefresh(inwin);
-
     int c = ERR, n = 0;
-    wtimeout(inwin, 100); /* poll every 100ms */
+    wtimeout(inwin, 100);
     echo();
     curs_set(1);
     while ((c = wgetch(inwin)) != ERR) {
         if (c == 10 || c == 13) { buf[n] = 0; break; }
-        if (c == 27 || c == 3) { break; }           /* ESC / Ctrl-C */
+        if (c == 27 || c == 3) { break; }
         if (c == KEY_BACKSPACE || c == 127 || c == 8) {
-            if (n > 0) { n--; inputbuf[n] = 0; }
+            if (n > 0) { n--; buf[n] = 0; }
         } else if (n < len - 1 && c >= 32 && c < 127) {
-            inputbuf[n++] = (char)c;
-            inputbuf[n] = 0;
+            buf[n++] = c; buf[n] = 0;
         }
-        redrawInput(prompt);
+        redrawInput(prompt, buf);
     }
     wtimeout(inwin, -1);
     noecho();
     curs_set(0);
-    buf[n] = 0;
     return (c == 10 || c == 13) ? 0 : -1;
 }

@@ -446,6 +446,16 @@ func main() {
 		return
 	}
 
+	// TUI mode: the ncurses UI starts first and drives scan → pick → connect → chat.
+	if *tuiMode {
+		if err := chatTUI(ctx, bz, nil, *scanDur); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// Plain stdin/stdout mode: connect first, then chat.
 	var target *device
 	switch {
 	case *addr != "":
@@ -465,14 +475,6 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-	}
-
-	if *tuiMode {
-		if err := chatTUI(ctx, bz, target, nil); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
-		return
 	}
 
 	f, err := bz.connect(ctx, target)
