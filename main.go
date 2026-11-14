@@ -34,13 +34,17 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/godbus/dbus/v5"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -194,13 +198,103 @@ func (b *bluez) scanForGhostlink(ctx context.Context, timeout time.Duration) (*d
 	}
 }
 
-// rfcommDir is where BlueZ's RFCOMM device nodes live. Overridable via env
-// for testing (e.g. point it at a dir with a fake /rfcomm5 socket).
+// rfcommDir is where BlueZ's RFCOMM device nodes live (only used by the
+// SerialPort1 path for older BlueZ). Overridable via env for testing.
 func rfcommDir() string {
 	if d := os.Getenv("GHOSTLINK_RFCOMM_DIR"); d != "" {
 		return d
 	}
 	return "/dev"
+}
+
+// getChannelFromSDP queries the remote device's SDP records to find the
+// RFCOMM channel number for the GhostLink SPP UUID. Returns -1 if not found.
+func getChannelFromSDP(addr string) int {
+	out, err := exec.Command("sdptool", "records", addr).Output()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "sdptool failed (%v)\n", err)
+		return -1
+	}
+
+	// The record looks like:
+	//   UUID 128: 8ce255c0-200a-11e0-ac64-0800200c9a66
+	//   Protocol Descriptor List:
+	//     "L2CAP" (0x0100)
+	//     "RFCOMM" (0x0003)
+	//       Channel: 28
+	// Non-greedy match: first Channel: after our UUID is the GhostLink one.
+	text := string(out)
+	re := regexp.MustCompile(`8ce255c0-200a-11e0-ac64-0800200c9a66[\s\S]*?Channel:\s*(\d+)`)
+	m := re.FindStringSubmatch(text)
+	if m == nil {
+		return -1
+	}
+	ch, err := strconv.Atoi(m[1])
+	if err != nil {
+		return -1
+	}
+	return ch
+}
+
+// bdaddr converts "AA:BB:CC:DD:EE:FF" to BlueZ's little-endian byte order
+// (the doc example: [6]byte{0x11,0x22,0x33,0xaa,0xbb,0xcc} == CC:BB:AA:33:22:11).
+func bdaddr(s string) ([6]uint8, error) {
+	var b [6]uint8
+	parts := strings.Split(s, ":")
+	if len(parts) != 6 {
+		return b, fmt.Errorf("bad MAC address %q", s)
+	}
+	for i, p := range parts {
+		v, err := strconv.ParseUint(p, 16, 8)
+		if err != nil {
+			return b, fmt.Errorf("bad MAC octet %q: %w", p, err)
+		}
+		b[5-i] = uint8(v)
+	}
+	return b, nil
+}
+
+// connectRFCOMMSocket opens the RFCOMM channel with a raw AF_BLUETOOTH socket
+// and wraps the fd in an *os.File so chat() can use it unchanged. This works
+// on BlueZ 5.85+ where SerialPort1 is gone, and needs no /dev/rfcomm node and
+// no root — unlike the old `rfcomm bind` route.
+func connectRFCOMMSocket(addr string, channel int) (*os.File, error) {
+	dst, err := bdaddr(addr)
+	if err != nil {
+		return nil, err
+	}
+	fd, err := unix.Socket(unix.AF_BLUETOOTH, unix.SOCK_STREAM, unix.BTPROTO_RFCOMM)
+	if err != nil {
+		return nil, fmt.Errorf("socket: %w", err)
+	}
+	sa := &unix.SockaddrRFCOMM{Addr: dst, Channel: uint8(channel)}
+
+	// Nonblocking connect so we can time out instead of hanging forever on a
+	// phone that isn't listening (app not in 'Host' mode).
+	unix.SetNonblock(fd, true)
+	err = unix.Connect(fd, sa)
+	if err != nil && err != unix.EINPROGRESS {
+		unix.Close(fd)
+		return nil, fmt.Errorf("connect: %w", err)
+	}
+	pfds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLOUT}}
+	n, err := unix.Poll(pfds, 20000)
+	if err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("poll: %w", err)
+	}
+	if n == 0 {
+		unix.Close(fd)
+		return nil, errors.New("timed out connecting to RFCOMM channel (is the GhostLink app in 'Host' mode on the phone?)")
+	}
+	if serr, _ := unix.GetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_ERROR); serr != 0 {
+		unix.Close(fd)
+		return nil, fmt.Errorf("connect: %v", unix.Errno(serr))
+	}
+
+	// Keep the fd non-blocking: os.NewFile then registers it with the runtime
+	// poller (like a net.Conn), so Close() cleanly interrupts a blocked Read.
+	return os.NewFile(uintptr(fd), "rfcomm:"+addr), nil
 }
 
 // serialPortChannel looks for a SerialPort1 object under dev and returns its
@@ -329,6 +423,7 @@ func main() {
 	listOnly := flag.Bool("list", false, "list devices advertising the GhostLink SPP service and exit")
 	addr := flag.String("addr", "", "connect directly to this MAC address (skips scanning)")
 	scanDur := flag.Duration("scan", 15*time.Second, "how long to scan when -addr is not given")
+	tuiMode := flag.Bool("tui", false, "use a ncurses text UI for the chat (default: stdin/stdout mode)")
 	flag.Parse()
 
 	conn, err := dbus.ConnectSystemBus()
@@ -370,6 +465,14 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
+	}
+
+	if *tuiMode {
+		if err := chatTUI(ctx, bz, target, nil); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	f, err := bz.connect(ctx, target)
